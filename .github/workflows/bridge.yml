@@ -1,0 +1,23 @@
+name: bridge
+on:
+  workflow_run:
+    workflows: ["nba"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Bridge games on/after this date (YYYY-MM-DD); default last 30 days"
+        required: false
+jobs:
+  run:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python -m jobs.bridge --commit ${{ github.event.inputs.since && format('--since {0}', github.event.inputs.since) || '' }}
+        env:
+          COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
