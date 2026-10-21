@@ -10,12 +10,14 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 import time
+import unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from nba_api.stats import endpoints
+import requests
 
 from jobs.db import connect
 from jobs.nba import GAME_TYPES, current_season
@@ -192,44 +194,60 @@ def _rest_lookup(games: list[dict]) -> dict:
     return rest
 
 
-# players.position is CHECK-constrained to the five-position set; the NBA bio only
-# has coarse labels, so this is an approximation (Guard -> PG, Forward -> SF, ...).
-POSITION_MAP = {
-    "Guard": "PG", "Guard-Forward": "SG", "Forward-Guard": "SF", "Forward": "SF",
-    "Forward-Center": "PF", "Center-Forward": "C", "Center": "C",
-}
+# players.position is CHECK-constrained to the five-position set; ESPN only has
+# coarse labels for some players, so G/F are approximated (G -> PG, F -> SF).
+POSITION_MAP = {"PG": "PG", "SG": "SG", "SF": "SF", "PF": "PF", "C": "C", "G": "PG", "F": "SF"}
+ESPN = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 
 
-def _player_info(person_id: str) -> dict | None:
-    """Fetch a new player's bio (players.date_of_birth is NOT NULL)."""
+def _norm(name: str) -> str:
+    """Accent-, case-, punctuation- and suffix-insensitive key for matching names across feeds."""
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z ]", "", s.replace("-", " "))
+    return " ".join(w for w in s.split() if w not in ("jr", "sr", "ii", "iii", "iv"))
+
+
+def _get(url: str) -> dict:
     for attempt in range(3):
         try:
-            rows = endpoints.CommonPlayerInfo(
-                player_id=person_id, timeout=30).get_normalized_dict()
-            info = rows["CommonPlayerInfo"][0]
-            dob = (info.get("BIRTHDATE") or "")[:10] or None
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception:  # noqa: BLE001
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
+
+
+def espn_bios() -> dict[str, dict]:
+    """Every rostered player's bio from ESPN's public team rosters, keyed by normalized name.
+
+    stats.nba.com is unreachable from the cloud, so new players' birthdates
+    (players.date_of_birth is NOT NULL) come from ESPN instead.
+    """
+    bios: dict[str, dict] = {}
+    teams = _get(f"{ESPN}/teams")["sports"][0]["leagues"][0]["teams"]
+    for t in teams:
+        for a in _get(f"{ESPN}/teams/{t['team']['id']}/roster").get("athletes", []):
+            dob = (a.get("dateOfBirth") or "")[:10]
             if not dob:
-                return None
-            return {
-                "player_id": str(person_id),
-                "first_name": info.get("FIRST_NAME") or "",
-                "last_name": info.get("LAST_NAME") or "",
-                "full_name": info.get("DISPLAY_FIRST_LAST") or "",
-                "position": POSITION_MAP.get(info.get("POSITION") or "", "NA"),
-                "team_id": str(info["TEAM_ID"]) if info.get("TEAM_ID") else None,
-                "height": info.get("HEIGHT") or None,
-                "weight": int(info["WEIGHT"]) if str(info.get("WEIGHT") or "").isdigit() else None,
+                continue
+            inches = a.get("height")
+            bios[_norm(a["fullName"])] = {
+                "first_name": a.get("firstName") or "",
+                "last_name": a.get("lastName") or "",
+                "full_name": a["fullName"],
+                "position": POSITION_MAP.get(a.get("position", {}).get("abbreviation"), "NA"),
+                "height": f"{int(inches) // 12}ft{int(inches) % 12}in" if inches else None,
+                "weight": int(a["weight"]) if a.get("weight") else None,
                 "date_of_birth": dob,
-                "country": info.get("COUNTRY") or None,
-                "years_exp": int(info["SEASON_EXP"]) if str(info.get("SEASON_EXP") or "").lstrip("-").isdigit() else None,
-                "draft_year": int(info["DRAFT_YEAR"]) if str(info.get("DRAFT_YEAR") or "").isdigit() else None,
+                "country": {"United States": "USA"}.get(
+                    a.get("birthPlace", {}).get("country"), a.get("birthPlace", {}).get("country")),
+                "years_exp": a.get("experience", {}).get("years"),
+                "draft_year": None,
                 "is_active": True,
             }
-        except Exception as exc:  # noqa: BLE001
-            if attempt == 2:
-                print(f"    player {person_id}: bio fetch failed ({type(exc).__name__})")
-                return None
-            time.sleep(3 * (attempt + 1))
+    return bios
 
 
 def build_rows(game: dict, eps: dict[str, dict], rest: dict) -> list[dict]:
@@ -298,7 +316,7 @@ def run(since: date, commit: bool) -> int:
             print("nothing to bridge (all collected games already in player_game_stats)")
             return 0
 
-        all_rows, new_games, missing_players, blanked = [], [], set(), 0
+        all_rows, new_games, missing_players, blanked = [], [], {}, 0
         for gid in todo:
             with conn.cursor() as cur:
                 cur.execute("SELECT endpoint, payload FROM raw_nba_boxscores WHERE game_id=%s", (gid,))
@@ -310,7 +328,12 @@ def run(since: date, commit: bool) -> int:
             blanked += blank_implausible_defense(rows)
             all_rows.extend(rows)
             new_games.append(g)
-            missing_players.update(r["player_id"] for r in rows if r["player_id"] not in known_players)
+            for side in ("homeTeam", "awayTeam"):
+                for pl in _body(eps["BoxScoreTraditionalV3"])[side]["players"]:
+                    pid = str(pl["personId"])
+                    if pid not in known_players:
+                        missing_players[pid] = (f"{pl['firstName']} {pl['familyName']}".strip(),
+                                                str(_body(eps["BoxScoreTraditionalV3"])[side]["teamId"]))
 
         print(f"{'COMMIT' if commit else 'DRY RUN'} | season {season} | {len(todo)} games to bridge | "
               f"{len(all_rows)} player rows | {len(missing_players)} new players to fetch | "
@@ -326,12 +349,15 @@ def run(since: date, commit: bool) -> int:
             print("  (dry run — pass --commit to write)")
             return 0
 
-        # 1) new players (FK) via CommonPlayerInfo
+        # 1) new players (FK) via ESPN roster bios
+        bios = espn_bios() if missing_players else {}
         for pid in sorted(missing_players):
-            info = _player_info(pid)
-            if not info:
-                print(f"  cannot create player {pid}; skipping its rows")
+            name, team_id = missing_players[pid]
+            bio = bios.get(_norm(name))
+            if not bio:
+                print(f"  no ESPN roster bio for {name} ({pid}); skipping its rows")
                 continue
+            info = {"player_id": pid, "team_id": team_id, **bio}
             cols = list(info)
             with conn.cursor() as cur:
                 cur.execute(f"INSERT INTO players ({','.join(cols)}) VALUES ({','.join(['%s']*len(cols))}) "
