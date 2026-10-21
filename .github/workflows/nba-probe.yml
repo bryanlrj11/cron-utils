@@ -3,11 +3,28 @@ on:
   workflow_dispatch: {}
 jobs:
   run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
-      - run: pip install -r requirements.txt nba_api
+      - run: pip install -r requirements.txt "requests[socks]" nba_api
+      - name: Start Tor (any exit on 9150, US exits on 9152)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq tor
+          tor --RunAsDaemon 1 --SocksPort 9150 --DataDirectory /tmp/tor-any
+          tor --RunAsDaemon 1 --SocksPort 9152 --DataDirectory /tmp/tor-us --ExitNodes '{us}' --StrictNodes 1
+      - name: Start Cloudflare WARP (SOCKS proxy on 40000)
+        continue-on-error: true
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+          sleep 5
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+          sleep 8
+          warp-cli --accept-tos status
       - run: python -u -m jobs.nba_probe
