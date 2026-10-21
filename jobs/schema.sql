@@ -22,3 +22,18 @@ CREATE TABLE IF NOT EXISTS raw_boxscores (
     fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     payload    JSONB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS raw_nba_schedule (
+    season     TEXT PRIMARY KEY,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload    JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw_nba_boxscores (
+    game_id    TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    game_date  DATE NOT NULL,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload    JSONB NOT NULL,
+    PRIMARY KEY (game_id, endpoint)
+);
