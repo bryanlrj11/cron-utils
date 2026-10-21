@@ -17,8 +17,29 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -r requirements-nba.txt
-      - env:
+
+      - name: Start Cloudflare WARP (SOCKS proxy on 40000)
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+          # Wait until the local SOCKS proxy actually answers before continuing.
+          for i in $(seq 1 20); do
+            curl -s --socks5 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace \
+              | grep -q "warp=on" && break
+            sleep 2
+          done
+          warp-cli --accept-tos status
+          curl -s --socks5 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep warp=
+
+      - name: Collect
+        env:
           COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
-          NBA_PROXY: ${{ secrets.NBA_PROXY }}
+          NBA_PROXY: socks5h://127.0.0.1:40000
           SINCE: ${{ inputs.since }}
         run: python -u -m jobs.nba ${SINCE:+--since "$SINCE"}
