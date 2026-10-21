@@ -1,0 +1,21 @@
+name: odds-close
+on:
+  schedule:
+    - cron: "*/15 22-23,0-3 * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: odds-close
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python -m jobs.odds close
+        env:
+          COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
+          ODDS_API_KEYS: ${{ secrets.ODDS_API_KEYS }}
