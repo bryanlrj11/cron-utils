@@ -1,9 +1,10 @@
 """Store the NBA schedule and final-game box scores from stats.nba.com via nba_api.
 
-stats.nba.com silently drops connections from cloud IPs (GitHub runners
-included), so this job runs on a home machine through Task Scheduler (see
-scripts/register_task.ps1) rather than in Actions. Each endpoint's raw JSON is
-its own row, so an interrupted run resumes where it stopped.
+stats.nba.com drops connections from cloud datacenter IPs (GitHub runners
+included) while answering residential ones, so requests go out through the
+egress URL in the NBA_PROXY secret, which nba_api accepts via its documented
+`proxy=` argument. An empty NBA_PROXY means a direct connection. Each endpoint's
+raw JSON is its own row, so an interrupted run resumes where it stopped.
 
 Usage:
     python -m jobs.nba [--since YYYY-MM-DD]   # default: final games in the last 14 days
@@ -11,10 +12,10 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from nba_api.stats import endpoints
@@ -32,6 +33,7 @@ BOXSCORE_ENDPOINTS = [
     "BoxScoreDefensiveV2", "BoxScoreSummaryV3", "BoxScoreMatchupsV3",
 ]
 REQUEST_GAP = 0.6  # seconds between calls; stats.nba.com throttles bursts
+PROXY = os.environ.get("NBA_PROXY", "")  # residential/VPN egress; "" = direct
 
 
 def current_season(today: date) -> str:
@@ -42,7 +44,7 @@ def current_season(today: date) -> str:
 def _call(name: str, **params) -> dict:
     for attempt in range(4):
         try:
-            return getattr(endpoints, name)(timeout=60, **params).get_dict()
+            return getattr(endpoints, name)(proxy=PROXY, timeout=30, **params).get_dict()
         except Exception:  # read timeouts and blank bodies (JSONDecodeError) are transient
             if attempt == 3:
                 raise
@@ -111,10 +113,6 @@ def run(since: date) -> int:
 
 
 if __name__ == "__main__":
-    if sys.stdout is None:  # pythonw under Task Scheduler has no console, so log to a file
-        log_dir = Path(__file__).resolve().parent.parent / "logs"
-        log_dir.mkdir(exist_ok=True)
-        sys.stdout = sys.stderr = open(log_dir / "nba.log", "a", encoding="utf-8", buffering=1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--since", type=date.fromisoformat,
                         default=datetime.now(ET).date() - timedelta(days=LOOKBACK_DAYS))
