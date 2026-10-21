@@ -1,2 +1,4 @@
 requests>=2.31
 psycopg2-binary>=2.9
+nba_api==1.11.4
+PySocks==1.7.1
