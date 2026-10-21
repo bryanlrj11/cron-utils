@@ -192,6 +192,14 @@ def _rest_lookup(games: list[dict]) -> dict:
     return rest
 
 
+# players.position is CHECK-constrained to the five-position set; the NBA bio only
+# has coarse labels, so this is an approximation (Guard -> PG, Forward -> SF, ...).
+POSITION_MAP = {
+    "Guard": "PG", "Guard-Forward": "SG", "Forward-Guard": "SF", "Forward": "SF",
+    "Forward-Center": "PF", "Center-Forward": "C", "Center": "C",
+}
+
+
 def _player_info(person_id: str) -> dict | None:
     """Fetch a new player's bio (players.date_of_birth is NOT NULL)."""
     for attempt in range(3):
@@ -207,7 +215,7 @@ def _player_info(person_id: str) -> dict | None:
                 "first_name": info.get("FIRST_NAME") or "",
                 "last_name": info.get("LAST_NAME") or "",
                 "full_name": info.get("DISPLAY_FIRST_LAST") or "",
-                "position": info.get("POSITION") or "",
+                "position": POSITION_MAP.get(info.get("POSITION") or "", "NA"),
                 "team_id": str(info["TEAM_ID"]) if info.get("TEAM_ID") else None,
                 "height": info.get("HEIGHT") or None,
                 "weight": int(info["WEIGHT"]) if str(info.get("WEIGHT") or "").isdigit() else None,
