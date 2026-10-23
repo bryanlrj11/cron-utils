@@ -1,7 +1,7 @@
 name: nba
 on:
   schedule:
-    - cron: "0 10,16 * * *"   # ~05-06h & 11-12h ET: after games finalize, then catch lagging tables
+    - cron: "13 10,16 * * *"   # ~05-06h & 11-12h ET: after games finalize, then catch lagging tables
   workflow_dispatch:
     inputs:
       since:

@@ -3,7 +3,7 @@ name: keepalive
 # re-enable them weekly.
 on:
   schedule:
-    - cron: "0 6 * * 1"
+    - cron: "29 6 * * 1"
   workflow_dispatch: {}
 permissions:
   actions: write
