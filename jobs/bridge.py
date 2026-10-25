@@ -289,10 +289,92 @@ def build_rows(game: dict, eps: dict[str, dict], rest: dict) -> list[dict]:
     return rows
 
 
+UNKNOWN_DOB = "1900-01-01"  # players.date_of_birth is NOT NULL; this marks "no source has it yet"
+
+
+def espn_search_bio(name: str) -> dict | None:
+    """Fallback for players on no current roster (just signed/waived): ESPN's player search.
+
+    Usually has no birthdate for these players, so the date falls back to
+    UNKNOWN_DOB and is replaced once a roster lists a real one (see heal_unknown_dobs).
+    """
+    try:
+        items = _get("https://site.web.api.espn.com/apis/common/v3/search"
+                     f"?query={requests.utils.quote(name)}&limit=5&type=player")["items"]
+        hit = next(i for i in items if i.get("league") == "nba" and _norm(i["displayName"]) == _norm(name))
+        a = _get(f"https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/{hit['id']}")["athlete"]
+    except Exception:  # noqa: BLE001 - no usable hit; caller skips the player
+        return None
+    inches = a.get("height")
+    return {
+        "first_name": a.get("firstName") or name.split()[0],
+        "last_name": a.get("lastName") or name.split()[-1],
+        "full_name": a.get("fullName") or name,
+        "position": POSITION_MAP.get((a.get("position") or {}).get("abbreviation"), "NA"),
+        "height": f"{int(inches) // 12}ft{int(inches) % 12}in" if inches else None,
+        "weight": int(a["weight"]) if a.get("weight") else None,
+        "date_of_birth": (a.get("dateOfBirth") or "")[:10] or UNKNOWN_DOB,
+        "country": None, "years_exp": None, "draft_year": None, "is_active": True,
+    }
+
+
+def heal_unknown_dobs(conn, bios: dict[str, dict]) -> int:
+    """Replace UNKNOWN_DOB placeholders once an ESPN roster lists a real birthdate."""
+    healed = 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT player_id, full_name FROM players WHERE date_of_birth = %s", (UNKNOWN_DOB,))
+        for pid, name in cur.fetchall():
+            bio = bios.get(_norm(name))
+            if bio and bio["date_of_birth"] != UNKNOWN_DOB:
+                cur.execute("UPDATE players SET date_of_birth=%s WHERE player_id=%s",
+                            (bio["date_of_birth"], pid))
+                healed += 1
+    conn.commit()
+    if healed:
+        print(f"filled in real birthdates for {healed} previously unknown players")
+    return healed
+
+
+def ensure_players(conn, missing: dict[str, tuple[str, str]], known_players: set[str]) -> None:
+    """Create players rows (FK parents) from ESPN, and upgrade placeholder birthdates."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM players WHERE date_of_birth = %s", (UNKNOWN_DOB,))
+        has_unknown = cur.fetchone()[0] > 0
+    bios = espn_bios() if (missing or has_unknown) else {}
+    heal_unknown_dobs(conn, bios)
+    for pid in sorted(missing):
+        name, team_id = missing[pid]
+        bio = bios.get(_norm(name)) or espn_search_bio(name)
+        if not bio:
+            # No source knows this player yet (e.g. two-way signee ESPN doesn't list). Keep his
+            # box-score rows rather than lose them; heal_unknown_dobs fills the rest in later.
+            name = name.replace(",", "")
+            first, _, last = name.partition(" ")
+            print(f"  no ESPN bio for {name} ({pid}); creating with placeholder birthdate")
+            bio = {"first_name": first, "last_name": last, "full_name": name, "position": "NA",
+                   "height": None, "weight": None, "date_of_birth": UNKNOWN_DOB, "country": None,
+                   "years_exp": None, "draft_year": None, "is_active": True}
+        info = {"player_id": pid, "team_id": team_id, **bio}
+        cols = list(info)
+        with conn.cursor() as cur:
+            cur.execute(f"INSERT INTO players ({','.join(cols)}) VALUES ({','.join(['%s']*len(cols))}) "
+                        f"ON CONFLICT (player_id) DO NOTHING", [info[c] for c in cols])
+        conn.commit()
+        known_players.add(pid)
+
+
+def _unknown_players(eps_trad: dict, known: set[str]) -> dict[str, tuple[str, str]]:
+    body = _body(eps_trad)
+    return {str(pl["personId"]): (f"{pl['firstName']} {pl['familyName']}".strip(), str(body[side]["teamId"]))
+            for side in ("homeTeam", "awayTeam") for pl in body[side]["players"]
+            if str(pl["personId"]) not in known}
+
+
 BACKFILL_COLUMNS = [c for m in ENDPOINT_MAPS.values() for c in m]
 
 
-def backfill(conn, game_ids: list[str], sched: dict, rest: dict, commit: bool) -> int:
+def backfill(conn, game_ids: list[str], sched: dict, rest: dict, commit: bool,
+             known_players: set[str] = frozenset()) -> int:
     """Fill NULL stat columns of already-bridged games from payloads stored since.
 
     The NBA publishes tracking/defensive/matchup tables hours or days after the
@@ -316,6 +398,14 @@ def backfill(conn, game_ids: list[str], sched: dict, rest: dict, commit: bool) -
         for row in rows:
             have = current.get(row["player_id"])
             if have is None:
+                # A player skipped earlier (no bio source yet) who now has a players row.
+                if row["player_id"] in known_players:
+                    game_cells += 1
+                    if commit:
+                        with conn.cursor() as cur:
+                            cur.execute(f"INSERT INTO player_game_stats ({','.join(STAT_COLUMNS)}) "
+                                        f"VALUES ({','.join(['%s'] * len(STAT_COLUMNS))})",
+                                        [row[c] for c in STAT_COLUMNS])
                 continue
             fill = {c: row[c] for c in BACKFILL_COLUMNS if have[c] is None and row[c] is not None}
             if not fill:
@@ -362,7 +452,15 @@ def run(since: date, commit: bool) -> int:
                       if gid not in done and sched.get(gid, {}).get("gameDateEst", "")[:10] >= since.isoformat())
         in_window = sorted(gid for gid in collected & done
                            if sched.get(gid, {}).get("gameDateEst", "")[:10] >= since.isoformat())
-        backfill(conn, in_window, sched, rest, commit)
+        if commit:  # players skipped earlier (no bio source then) get their rows now
+            late = {}
+            for gid in in_window:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT payload FROM raw_nba_boxscores WHERE game_id=%s "
+                                "AND endpoint='BoxScoreTraditionalV3'", (gid,))
+                    late.update(_unknown_players(cur.fetchone()[0], known_players))
+            ensure_players(conn, late, known_players)
+        backfill(conn, in_window, sched, rest, commit, known_players)
         if not todo:
             print("nothing to bridge (all collected games already in player_game_stats)")
             return 0
@@ -401,20 +499,7 @@ def run(since: date, commit: bool) -> int:
             return 0
 
         # 1) new players (FK) via ESPN roster bios
-        bios = espn_bios() if missing_players else {}
-        for pid in sorted(missing_players):
-            name, team_id = missing_players[pid]
-            bio = bios.get(_norm(name))
-            if not bio:
-                print(f"  no ESPN roster bio for {name} ({pid}); skipping its rows")
-                continue
-            info = {"player_id": pid, "team_id": team_id, **bio}
-            cols = list(info)
-            with conn.cursor() as cur:
-                cur.execute(f"INSERT INTO players ({','.join(cols)}) VALUES ({','.join(['%s']*len(cols))}) "
-                            f"ON CONFLICT (player_id) DO NOTHING", [info[c] for c in cols])
-            conn.commit()
-            known_players.add(pid)
+        ensure_players(conn, missing_players, known_players)
 
         # 2) games (FK)
         for g in new_games:
