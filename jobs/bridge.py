@@ -177,21 +177,33 @@ def blank_implausible_defense(game_rows: list[dict]) -> int:
     return len(game_rows)
 
 
-def _rest_lookup(games: list[dict]) -> dict:
-    """(team_id, game_id) -> days since that team's previous game on the schedule."""
-    by_team: dict[str, list[tuple[str, str]]] = {}
-    for g in games:
-        d = g["gameDateEst"][:10]
-        for side in ("homeTeam", "awayTeam"):
-            by_team.setdefault(str(g[side]["teamId"]), []).append((d, g["gameId"]))
-    rest: dict[tuple[str, str], int] = {}
-    for team, entries in by_team.items():
-        entries.sort()
-        for i, (d, gid) in enumerate(entries):
-            if i:
-                prev = date.fromisoformat(entries[i - 1][0])
-                rest[(team, gid)] = (date.fromisoformat(d) - prev).days
-    return rest
+def recompute_days_rest(conn, since: date, commit: bool) -> int:
+    """Set days_rest for rows on or after `since` the way the historical rows have it.
+
+    days_rest is days between the player's previous box-score row (DNPs included,
+    across seasons) and this one, minus one: back-to-back = 0, first row ever = NULL.
+    It depends on every earlier row, so it is recomputed after inserts rather than
+    at build time (a game loaded late shifts the rest of the next one). Only rows
+    whose value changes are written. Returns that count.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "WITH r AS (SELECT p.player_id, p.game_id, p.days_rest, g.game_date, "
+            "  (g.game_date - lag(g.game_date) OVER (PARTITION BY p.player_id "
+            "   ORDER BY g.game_date, p.game_id)) - 1 AS rest "
+            "  FROM player_game_stats p JOIN games g USING (game_id)) "
+            "SELECT player_id, game_id, rest FROM r "
+            "WHERE game_date >= %s AND days_rest IS DISTINCT FROM rest", (since,))
+        changes = cur.fetchall()
+        if commit:
+            for pid, gid, rest in changes:
+                cur.execute("UPDATE player_game_stats SET days_rest=%s "
+                            "WHERE player_id=%s AND game_id=%s", (rest, pid, gid))
+    if commit:
+        conn.commit()
+    if changes:
+        print(f"{'set' if commit else 'would set'} days_rest on {len(changes)} rows since {since}")
+    return len(changes)
 
 
 # players.position is CHECK-constrained to the five-position set; ESPN only has
@@ -250,8 +262,11 @@ def espn_bios() -> dict[str, dict]:
     return bios
 
 
-def build_rows(game: dict, eps: dict[str, dict], rest: dict) -> list[dict]:
-    """One player_game_stats dict per player in the game's traditional box score."""
+def build_rows(game: dict, eps: dict[str, dict]) -> list[dict]:
+    """One player_game_stats dict per player in the game's traditional box score.
+
+    days_rest is left NULL; recompute_days_rest fills it once the rows are stored.
+    """
     trad = eps["BoxScoreTraditionalV3"]
     sides = {"homeTeam": ("home", "awayTeam"), "awayTeam": ("away", "homeTeam")}
     # Index every endpoint's players by (team_id, person_id) -> statistics.
@@ -279,7 +294,7 @@ def build_rows(game: dict, eps: dict[str, dict], rest: dict) -> list[dict]:
                 "minutes": parse_minutes(p.get("statistics", {}).get("minutes")),
                 "was_starter": bool(p.get("position")),
                 "dnp_reason": p.get("comment") or None, "injury_status": None,
-                "days_rest": rest.get((team_id, game["gameId"])),
+                "days_rest": None,
             }
             for name, colmap in ENDPOINT_MAPS.items():
                 stats = indexed.get(name, {}).get(pid, {})
@@ -373,7 +388,7 @@ def _unknown_players(eps_trad: dict, known: set[str]) -> dict[str, tuple[str, st
 BACKFILL_COLUMNS = [c for m in ENDPOINT_MAPS.values() for c in m]
 
 
-def backfill(conn, game_ids: list[str], sched: dict, rest: dict, commit: bool,
+def backfill(conn, game_ids: list[str], sched: dict, commit: bool,
              known_players: set[str] = frozenset()) -> int:
     """Fill NULL stat columns of already-bridged games from payloads stored since.
 
@@ -392,7 +407,7 @@ def backfill(conn, game_ids: list[str], sched: dict, rest: dict, commit: bool,
             cur.execute(f"SELECT player_id, {','.join(BACKFILL_COLUMNS)} FROM player_game_stats "
                         "WHERE game_id=%s", (gid,))
             current = {r[0]: dict(zip(BACKFILL_COLUMNS, r[1:])) for r in cur.fetchall()}
-        rows = build_rows(sched[gid], eps, rest)
+        rows = build_rows(sched[gid], eps)
         blank_implausible_defense(rows)
         game_cells = 0
         for row in rows:
@@ -437,7 +452,6 @@ def run(since: date, commit: bool) -> int:
                 print(f"no schedule for {season}; run jobs.nba first")
                 return 0
             games = [g for d in srow[0]["leagueSchedule"]["gameDates"] for g in d["games"]]
-            rest = _rest_lookup(games)
 
             cur.execute("SELECT DISTINCT game_id FROM player_game_stats")
             done = {r[0] for r in cur.fetchall()}
@@ -460,8 +474,9 @@ def run(since: date, commit: bool) -> int:
                                 "AND endpoint='BoxScoreTraditionalV3'", (gid,))
                     late.update(_unknown_players(cur.fetchone()[0], known_players))
             ensure_players(conn, late, known_players)
-        backfill(conn, in_window, sched, rest, commit, known_players)
+        backfill(conn, in_window, sched, commit, known_players)
         if not todo:
+            recompute_days_rest(conn, since, commit)
             print("nothing to bridge (all collected games already in player_game_stats)")
             return 0
 
@@ -473,7 +488,7 @@ def run(since: date, commit: bool) -> int:
             if "BoxScoreTraditionalV3" not in eps:
                 continue
             g = sched[gid]
-            rows = build_rows(g, eps, rest)
+            rows = build_rows(g, eps)
             blanked += blank_implausible_defense(rows)
             all_rows.extend(rows)
             new_games.append(g)
@@ -533,6 +548,7 @@ def run(since: date, commit: bool) -> int:
             inserted += 1
         conn.commit()
         print(f"  committed {len(new_games)} games, {inserted} player_game_stats rows")
+        recompute_days_rest(conn, since, commit)
         return inserted
 
 
