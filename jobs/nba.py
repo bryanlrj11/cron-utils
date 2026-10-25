@@ -43,9 +43,19 @@ def current_season(today: date) -> str:
 
 def _call(name: str, **params) -> dict:
     for attempt in range(4):
+        ep = getattr(endpoints, name)(proxy=PROXY, timeout=30, get_request=False, **params)
         try:
-            return getattr(endpoints, name)(proxy=PROXY, timeout=30, **params).get_dict()
+            ep.get_request()
+            return ep.get_dict()
         except Exception:  # read timeouts and blank bodies (JSONDecodeError) are transient
+            # nba_api's parser crashes on the empty shell the NBA serves for tables it
+            # hasn't published; that is a valid answer (no players yet), not a failure.
+            response = getattr(ep, "nba_response", None)
+            if response is not None:
+                try:
+                    return response.get_dict()
+                except Exception:  # noqa: BLE001 - body wasn't JSON; retry below
+                    pass
             if attempt == 3:
                 raise
             time.sleep(5 * 2 ** attempt)
@@ -54,7 +64,7 @@ def _call(name: str, **params) -> dict:
 def _has_players(payload: dict) -> bool:
     """Tracking/hustle tables can lag the final buzzer; an empty one is retried next run."""
     body = next(v for k, v in payload.items() if k != "meta")
-    return all(body.get(side, {}).get("players") for side in ("homeTeam", "awayTeam"))
+    return all((body.get(side) or {}).get("players") for side in ("homeTeam", "awayTeam"))
 
 
 def _store_schedule(conn, season: str) -> list[dict]:
