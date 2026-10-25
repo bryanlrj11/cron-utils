@@ -289,6 +289,54 @@ def build_rows(game: dict, eps: dict[str, dict], rest: dict) -> list[dict]:
     return rows
 
 
+BACKFILL_COLUMNS = [c for m in ENDPOINT_MAPS.values() for c in m]
+
+
+def backfill(conn, game_ids: list[str], sched: dict, rest: dict, commit: bool) -> int:
+    """Fill NULL stat columns of already-bridged games from payloads stored since.
+
+    The NBA publishes tracking/defensive/matchup tables hours or days after the
+    final buzzer (sometimes never at first), so a game can be bridged without
+    them. Only NULLs are filled (COALESCE-style), never overwritten, so this is
+    idempotent and safe to run on every bridge.
+    """
+    filled_cells = touched_games = 0
+    for gid in game_ids:
+        with conn.cursor() as cur:
+            cur.execute("SELECT endpoint, payload FROM raw_nba_boxscores WHERE game_id=%s", (gid,))
+            eps = dict(cur.fetchall())
+            if "BoxScoreTraditionalV3" not in eps:
+                continue
+            cur.execute(f"SELECT player_id, {','.join(BACKFILL_COLUMNS)} FROM player_game_stats "
+                        "WHERE game_id=%s", (gid,))
+            current = {r[0]: dict(zip(BACKFILL_COLUMNS, r[1:])) for r in cur.fetchall()}
+        rows = build_rows(sched[gid], eps, rest)
+        blank_implausible_defense(rows)
+        game_cells = 0
+        for row in rows:
+            have = current.get(row["player_id"])
+            if have is None:
+                continue
+            fill = {c: row[c] for c in BACKFILL_COLUMNS if have[c] is None and row[c] is not None}
+            if not fill:
+                continue
+            game_cells += len(fill)
+            if commit:
+                with conn.cursor() as cur:
+                    cur.execute(f"UPDATE player_game_stats SET {','.join(f'{c}=%s' for c in fill)} "
+                                "WHERE player_id=%s AND game_id=%s",
+                                [*fill.values(), row["player_id"], gid])
+        if game_cells:
+            touched_games += 1
+            filled_cells += game_cells
+            if commit:
+                conn.commit()
+    if filled_cells:
+        print(f"{'backfilled' if commit else 'would backfill'} {filled_cells} NULL cells "
+              f"across {touched_games} already-bridged games")
+    return filled_cells
+
+
 def run(since: date, commit: bool) -> int:
     with connect() as conn:
         season = current_season(datetime.now(ET).date())
@@ -312,6 +360,9 @@ def run(since: date, commit: bool) -> int:
         sched = {g["gameId"]: g for g in games}
         todo = sorted(gid for gid in collected
                       if gid not in done and sched.get(gid, {}).get("gameDateEst", "")[:10] >= since.isoformat())
+        in_window = sorted(gid for gid in collected & done
+                           if sched.get(gid, {}).get("gameDateEst", "")[:10] >= since.isoformat())
+        backfill(conn, in_window, sched, rest, commit)
         if not todo:
             print("nothing to bridge (all collected games already in player_game_stats)")
             return 0
