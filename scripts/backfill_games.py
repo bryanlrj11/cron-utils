@@ -6,7 +6,8 @@ jobs.nba collects (stored in raw_nba_boxscores for provenance), maps them with
 the bridge's own build_rows, inserts the games row and player rows, then
 recomputes days_rest from the earliest loaded date on (the game after each
 loaded one changes too). Games already in player_game_stats are skipped, so
-re-running is safe. Needs a
+re-running is safe (it also loads defensive_matchups for every game id given, from the
+stored payloads, so it can be re-run for games loaded before the loader existed). Needs a
 connection stats.nba.com answers (a residential IP or NBA_PROXY).
 
 Usage:
@@ -20,7 +21,7 @@ from datetime import date
 
 from jobs.bridge import (
     GAME_TYPE_LABEL, STAT_COLUMNS, _body, _num, _unknown_players,
-    blank_implausible_defense, build_rows, ensure_players, recompute_days_rest,
+    blank_implausible_defense, build_rows, ensure_players, load_matchups, recompute_days_rest,
 )
 from jobs.db import connect
 from jobs.nba import BOXSCORE_ENDPOINTS, REQUEST_GAP, _call, _has_players
@@ -107,6 +108,7 @@ def run(game_ids: list[str], commit: bool) -> None:
                                     [row[c] for c in STAT_COLUMNS])
             conn.commit()
 
+        load_matchups(conn, game_ids, known_players, commit)
         if todo:
             earliest = min(schedules[season_of(g)][g]["gameDateEst"][:10] for g in todo)
             recompute_days_rest(conn, date.fromisoformat(earliest), commit)

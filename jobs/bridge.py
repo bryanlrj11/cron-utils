@@ -17,6 +17,7 @@ import unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import psycopg2.extras
 import requests
 
 from jobs.db import connect
@@ -385,6 +386,111 @@ def _unknown_players(eps_trad: dict, known: set[str]) -> dict[str, tuple[str, st
             if str(pl["personId"]) not in known}
 
 
+# defensive_matchups column <- BoxScoreMatchupsV3 statistics field. The payload nests
+# offensive players under the defender guarding them; matchup_minutes comes from the
+# "m:ss" string (the sort field is in seconds).
+MATCHUP_FIELDS = {
+    "partial_possessions": "partialPossessions",
+    "percentage_defender_total_time": "percentageDefenderTotalTime",
+    "percentage_offensive_total_time": "percentageOffensiveTotalTime",
+    "percentage_total_time_both_on": "percentageTotalTimeBothOn",
+    "switches_on": "switchesOn", "player_points": "playerPoints", "team_points": "teamPoints",
+    "matchup_assists": "matchupAssists", "matchup_potential_assists": "matchupPotentialAssists",
+    "matchup_turnovers": "matchupTurnovers", "matchup_blocks": "matchupBlocks",
+    "matchup_field_goals_made": "matchupFieldGoalsMade",
+    "matchup_field_goals_attempted": "matchupFieldGoalsAttempted",
+    "matchup_field_goal_percentage": "matchupFieldGoalsPercentage",
+    "matchup_three_pointers_made": "matchupThreePointersMade",
+    "matchup_three_pointers_attempted": "matchupThreePointersAttempted",
+    "matchup_three_point_percentage": "matchupThreePointersPercentage",
+    "help_blocks": "helpBlocks", "help_field_goals_made": "helpFieldGoalsMade",
+    "help_field_goals_attempted": "helpFieldGoalsAttempted",
+    "help_field_goal_percentage": "helpFieldGoalsPercentage",
+    "matchup_free_throws_made": "matchupFreeThrowsMade",
+    "matchup_free_throws_attempted": "matchupFreeThrowsAttempted",
+    "shooting_fouls": "shootingFouls",
+}
+MATCHUP_COLUMNS = ["off_player_id", "def_player_id", "def_team_id", "game_id", "matchup_minutes",
+                   *MATCHUP_FIELDS, "is_primary_defender"]
+# One game's matchup block with a value past these is the season-scale kind of bad
+# payload (see DEF_LIMITS); limits sit above the historical per-game maxima.
+MATCHUP_LIMITS = {"matchup_minutes": 48, "matchup_field_goals_attempted": 60,
+                  "partial_possessions": 200, "player_points": 80}
+# A defender is only "primary" for an offensive player he guarded at least this many
+# minutes; among those, the most partial possessions wins. This rule reproduces the
+# flag on 99.94% of 472k historical rows (the rest are possession ties).
+PRIMARY_MIN_MINUTES = 1.0
+
+
+def build_matchup_rows(payload: dict) -> list[dict]:
+    """One defensive_matchups dict per (defender, offensive player) pair in a game."""
+    body = _body(payload)
+    rows = []
+    for side in ("homeTeam", "awayTeam"):
+        team_id = str(body[side]["teamId"])
+        for defender in body[side].get("players", []):
+            for matchup in defender.get("matchups", []):
+                stats = matchup.get("statistics", {})
+                row = {"off_player_id": str(matchup["personId"]),
+                       "def_player_id": str(defender["personId"]), "def_team_id": team_id,
+                       "game_id": body["gameId"], "matchup_minutes": parse_minutes(stats.get("matchupMinutes"))}
+                for column, field in MATCHUP_FIELDS.items():
+                    row[column] = _num(stats.get(field))
+                row["is_primary_defender"] = False
+                rows.append(row)
+    best: dict[str, dict] = {}
+    for row in rows:
+        if (row["matchup_minutes"] or 0) < PRIMARY_MIN_MINUTES:
+            continue
+        top = best.get(row["off_player_id"])
+        if top is None or (row["partial_possessions"] or 0) > (top["partial_possessions"] or 0):
+            best[row["off_player_id"]] = row
+    for row in best.values():
+        row["is_primary_defender"] = True
+    return rows
+
+
+def load_matchups(conn, game_ids: list[str], known_players: set[str], commit: bool) -> int:
+    """Insert defensive_matchups for games that have a stored BoxScoreMatchupsV3 payload.
+
+    A game is loaded once, as a whole: games that already have matchup rows are skipped
+    (the NBA publishes this table late, so later runs pick up games it was missing for),
+    and pairs naming a player not in players are dropped. Returns rows inserted (or that
+    would be).
+    """
+    if not game_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT game_id FROM defensive_matchups WHERE game_id = ANY(%s)", (game_ids,))
+        loaded = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT game_id, payload FROM raw_nba_boxscores "
+                    "WHERE endpoint='BoxScoreMatchupsV3' AND game_id = ANY(%s) ORDER BY game_id",
+                    ([g for g in game_ids if g not in loaded],))
+        payloads = cur.fetchall()
+    total = games = 0
+    for gid, payload in payloads:
+        rows = build_matchup_rows(payload)
+        if any(r[c] is not None and r[c] > lim for r in rows for c, lim in MATCHUP_LIMITS.items()):
+            print(f"  {gid}: matchup values past plausible limits; not loaded")
+            continue
+        kept = [r for r in rows if r["off_player_id"] in known_players and r["def_player_id"] in known_players]
+        if not kept:
+            continue
+        if len(kept) < len(rows):
+            print(f"  {gid}: dropped {len(rows) - len(kept)} matchup rows naming unknown players")
+        total += len(kept)
+        games += 1
+        if commit:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur, f"INSERT INTO defensive_matchups ({','.join(MATCHUP_COLUMNS)}) VALUES %s",
+                    [[r[c] for c in MATCHUP_COLUMNS] for r in kept], page_size=500)
+            conn.commit()
+    if total:
+        print(f"{'loaded' if commit else 'would load'} {total} defensive_matchups rows for {games} games")
+    return total
+
+
 BACKFILL_COLUMNS = [c for m in ENDPOINT_MAPS.values() for c in m]
 
 
@@ -475,6 +581,7 @@ def run(since: date, commit: bool) -> int:
                     late.update(_unknown_players(cur.fetchone()[0], known_players))
             ensure_players(conn, late, known_players)
         backfill(conn, in_window, sched, commit, known_players)
+        load_matchups(conn, in_window, known_players, commit)
         if not todo:
             recompute_days_rest(conn, since, commit)
             print("nothing to bridge (all collected games already in player_game_stats)")
@@ -549,6 +656,7 @@ def run(since: date, commit: bool) -> int:
         conn.commit()
         print(f"  committed {len(new_games)} games, {inserted} player_game_stats rows")
         recompute_days_rest(conn, since, commit)
+        load_matchups(conn, todo, known_players, commit)
         return inserted
 
 
