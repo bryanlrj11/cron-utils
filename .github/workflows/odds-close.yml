@@ -1,7 +1,7 @@
 name: odds-close
 on:
   schedule:
-    - cron: "7,22,37,52 16-23,0-3 * * *"
+    - cron: "7,37 16-23,0-3 * * *"
   workflow_dispatch: {}
 concurrency:
   group: odds-close
@@ -9,13 +9,13 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -r requirements.txt
-      - run: python -m jobs.odds close
+      - run: python -m jobs.odds close-watch
         env:
           COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
           ODDS_API_KEYS: ${{ secrets.ODDS_API_KEYS }}
