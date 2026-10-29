@@ -548,6 +548,39 @@ def backfill(conn, game_ids: list[str], sched: dict, commit: bool,
     return filled_cells
 
 
+SCHEDULE_LOOKAHEAD_DAYS = 7
+FINAL_GAME_STATUS = 3
+
+
+def upsert_scheduled_games(conn, games: list[dict], season: str, today: date, commit: bool) -> int:
+    """Insert not-yet-final games from today onward so the app can see tonight's slate.
+
+    Box scores only exist after tip-off, so bridging them alone leaves ``games``
+    without any upcoming fixture and the daily inference job finds no players.
+    A game already marked final is left alone; a rescheduled one gets its new date.
+    """
+    horizon = today + timedelta(days=SCHEDULE_LOOKAHEAD_DAYS)
+    upcoming = [
+        g for g in games
+        if g["gameId"][:3] in GAME_TYPE_LABEL
+        and g.get("gameStatus") != FINAL_GAME_STATUS
+        and today <= date.fromisoformat(g["gameDateEst"][:10]) <= horizon
+    ]
+    if commit:
+        with conn.cursor() as cur:
+            for g in upcoming:
+                cur.execute(
+                    "INSERT INTO games (game_id, game_date, season, game_type, home_team_id, "
+                    "away_team_id, tipoff_time_utc, status) VALUES (%s,%s,%s,%s,%s,%s,%s,'scheduled') "
+                    "ON CONFLICT (game_id) DO UPDATE SET game_date = EXCLUDED.game_date, "
+                    "tipoff_time_utc = EXCLUDED.tipoff_time_utc WHERE games.status <> 'final'",
+                    (g["gameId"], g["gameDateEst"][:10], season, GAME_TYPE_LABEL[g["gameId"][:3]],
+                     str(g["homeTeam"]["teamId"]), str(g["awayTeam"]["teamId"]), g["gameDateTimeUTC"]))
+        conn.commit()
+    print(f"{'COMMIT' if commit else 'DRY RUN'} | {len(upcoming)} upcoming games through {horizon}")
+    return len(upcoming)
+
+
 def run(since: date, commit: bool) -> int:
     with connect() as conn:
         season = current_season(datetime.now(ET).date())
@@ -567,6 +600,7 @@ def run(since: date, commit: bool) -> int:
             cur.execute("SELECT player_id FROM players")
             known_players = {r[0] for r in cur.fetchall()}
 
+        upsert_scheduled_games(conn, games, season, datetime.now(ET).date(), commit)
         sched = {g["gameId"]: g for g in games}
         todo = sorted(gid for gid in collected
                       if gid not in done and sched.get(gid, {}).get("gameDateEst", "")[:10] >= since.isoformat())
@@ -634,7 +668,8 @@ def run(since: date, commit: bool) -> int:
                 cur.execute(
                     "INSERT INTO games (game_id, game_date, season, game_type, home_team_id, "
                     "away_team_id, tipoff_time_utc, status, home_score, away_score) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,'final',%s,%s) ON CONFLICT (game_id) DO NOTHING",
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,'final',%s,%s) ON CONFLICT (game_id) DO UPDATE SET status = 'final', "
+                    "home_score = EXCLUDED.home_score, away_score = EXCLUDED.away_score",
                     (g["gameId"], g["gameDateEst"][:10], season,
                      GAME_TYPE_LABEL.get(g["gameId"][:3], "regular"),
                      str(g["homeTeam"]["teamId"]), str(g["awayTeam"]["teamId"]),
