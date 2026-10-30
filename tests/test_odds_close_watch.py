@@ -141,3 +141,64 @@ def test_final_snapshot_due(stored_seconds_before_tip, books, now_seconds_before
     now = tip - timedelta(seconds=now_seconds_before_tip)
 
     assert odds.final_snapshot_due(stored, tip, now) is due
+
+
+def test_budget_exhaustion_reports_the_event_list_so_a_successor_can_start():
+    harness = Harness({"a": tip_in(hours=1), "b": tip_in(hours=8)})
+    reported = []
+
+    odds.watch_close(
+        harness.list_events, lambda: dict(harness.stored), harness.snapshot,
+        clock=lambda: harness.now, sleep=harness.sleep, on_budget_used=reported.append,
+    )
+
+    assert len(reported) == 1
+    assert {event["id"] for event in reported[0]} == {"a", "b"}
+
+
+class FakeResponse:
+    def raise_for_status(self):
+        pass
+
+
+def test_a_successor_is_dispatched_only_when_a_game_is_still_ahead(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return FakeResponse()
+
+    ahead = [{"id": "a", "commence_time": (START + timedelta(hours=2)).isoformat()}]
+    behind = [{"id": "a", "commence_time": (START - timedelta(hours=2)).isoformat()}]
+
+    assert odds.dispatch_successor(ahead, START, post=post) is True
+    assert odds.dispatch_successor(behind, START, post=post) is False
+    assert calls == ["https://api.github.com/repos/owner/repo/actions/workflows/odds-close.yml/dispatches"]
+
+
+def test_a_failed_hand_over_is_swallowed(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+
+    def post(url, **kwargs):
+        raise odds.requests.ConnectionError("down")
+
+    ahead = [{"id": "a", "commence_time": (START + timedelta(hours=2)).isoformat()}]
+
+    assert odds.dispatch_successor(ahead, START, post=post) is False
+
+
+def test_an_idle_watcher_exits_without_handing_over_when_the_next_game_is_far_off():
+    harness = Harness({"a": tip_in(hours=20)})
+    reported = []
+
+    saved = odds.watch_close(
+        harness.list_events, lambda: dict(harness.stored), harness.snapshot,
+        clock=lambda: harness.now, sleep=harness.sleep, on_budget_used=reported.append,
+    )
+
+    assert saved == 0
+    assert reported == []
+    assert harness.now == START

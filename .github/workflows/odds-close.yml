@@ -6,6 +6,8 @@ on:
 concurrency:
   group: odds-close
   cancel-in-progress: false
+permissions:
+  actions: write  # lets a watcher dispatch its successor
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -19,3 +21,4 @@ jobs:
         env:
           COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
           ODDS_API_KEYS: ${{ secrets.ODDS_API_KEYS }}
+          GITHUB_TOKEN: ${{ github.token }}

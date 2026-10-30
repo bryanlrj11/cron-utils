@@ -16,9 +16,15 @@ costs a bounded number of credits however often the job runs.
 captures a game if a run happens to land in the hours before tip. The watcher
 needs just one run to start, then stays up and fetches each game once, a few
 minutes before tip (twice if that snapshot comes back thin).
+
+A watcher also hands over to its successor: if it uses up its runtime budget
+while games are still ahead, it dispatches the workflow again rather than wait
+for a scheduled run that GitHub may drop. Only games within CHAIN_HORIZON count, so
+an idle watcher exits instead of handing over to a successor with nothing to do.
 """
 
 import json
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -48,6 +54,9 @@ FINAL_ACCEPTABLE = timedelta(minutes=10)  # a snapshot taken this near tip alrea
 WATCH_POLL = timedelta(seconds=30)
 WATCH_RELIST_EVERY = timedelta(minutes=10)  # re-read tip times; delays and postponements happen
 WATCH_MAX_RUNTIME = timedelta(hours=5, minutes=40)  # inside the workflow's timeout
+# Games this far past the runtime budget keep a watcher up and are handed to a successor.
+# A watcher with nothing nearer than this exits, so hand-overs cannot spin while idle.
+CHAIN_HORIZON = timedelta(hours=8)
 
 
 class QuotaExhausted(Exception):
@@ -167,7 +176,7 @@ def final_snapshot_due(stored: tuple[datetime, int] | None, commence: datetime,
 
 
 def watch_close(list_events, load_stored, snapshot, clock=lambda: datetime.now(timezone.utc),
-                sleep=time.sleep) -> int:
+                sleep=time.sleep, on_budget_used=None) -> int:
     """Take each upcoming game's closing snapshot just before tip, then return.
 
     Args:
@@ -176,6 +185,8 @@ def watch_close(list_events, load_stored, snapshot, clock=lambda: datetime.now(t
         snapshot: Fetches and stores one event; returns "saved", "skipped" or "stop".
         clock: Current time; replaceable in tests.
         sleep: Sleeps for a number of seconds; replaceable in tests.
+        on_budget_used: Called with the latest event list when the runtime budget runs out
+            before the games are done; the caller uses it to start a successor.
 
     Returns:
         The number of snapshots saved.
@@ -189,7 +200,8 @@ def watch_close(list_events, load_stored, snapshot, clock=lambda: datetime.now(t
         if listed_at is None or now - listed_at >= WATCH_RELIST_EVERY:
             events = list_events()
             listed_at = now
-        pending = [e for e in events if now < _parse(e["commence_time"]) <= deadline]
+        pending = [e for e in events
+                   if now < _parse(e["commence_time"]) <= deadline + CHAIN_HORIZON]
         if not pending:
             print("close-watch: no upcoming games left in this run's reach")
             return saved
@@ -203,7 +215,42 @@ def watch_close(list_events, load_stored, snapshot, clock=lambda: datetime.now(t
         sleep(WATCH_POLL.total_seconds())
         if clock() >= deadline:
             print("close-watch: runtime budget used; a later run picks up the rest")
+            if on_budget_used is not None:
+                on_budget_used(events)
             return saved
+
+
+def dispatch_successor(events: list[dict], now: datetime, post=requests.post) -> bool:
+    """Start a new close-watch run when games are still ahead of this one.
+
+    Args:
+        events: The latest Odds API event list.
+        now: Current time.
+        post: HTTP POST function; replaceable in tests.
+
+    Returns:
+        True when a successor run was requested. Never raises: a failed hand-over only
+        means the next scheduled run starts the watch instead.
+    """
+    if not any(now < _parse(e["commence_time"]) <= now + CHAIN_HORIZON for e in events):
+        return False
+    repository, token = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
+    if not repository or not token:
+        print("close-watch: no GITHUB_TOKEN; leaving the hand-over to the schedule")
+        return False
+    try:
+        response = post(
+            f"https://api.github.com/repos/{repository}/actions/workflows/odds-close.yml/dispatches",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json={"ref": os.environ.get("GITHUB_REF_NAME", "main")},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"close-watch: hand-over failed ({exc}); leaving it to the schedule", file=sys.stderr)
+        return False
+    print("close-watch: dispatched a successor run")
+    return True
 
 
 def run_close_watch() -> int:
@@ -226,8 +273,10 @@ def run_close_watch() -> int:
             conn.commit()
             return {r[0]: (r[1], r[2]) for r in rows}
 
-        return watch_close(list_events, load_stored,
-                           lambda event: _snapshot_event(conn, pool, "close", event))
+        return watch_close(
+            list_events, load_stored, lambda event: _snapshot_event(conn, pool, "close", event),
+            on_budget_used=lambda events: dispatch_successor(events, datetime.now(timezone.utc)),
+        )
 
 
 def run(kind: str) -> int:
