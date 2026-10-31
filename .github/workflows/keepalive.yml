@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          for wf in odds-open odds-close boxscores; do
-            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$wf.yml/enable"
+          for wf in odds-open.yml odds-close.yml boxscores.yml nba.yaml keepalive.yml; do
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$wf/enable"
           done
         env:
           GH_TOKEN: ${{ github.token }}

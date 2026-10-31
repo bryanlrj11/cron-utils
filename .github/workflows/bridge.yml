@@ -14,10 +14,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12", cache: pip }
       - run: pip install -r requirements.txt
-      - run: python -m jobs.bridge --commit ${{ github.event.inputs.since && format('--since {0}', github.event.inputs.since) || '' }}
+      - run: python -u -m jobs.bridge --commit ${{ github.event.inputs.since && format('--since {0}', github.event.inputs.since) || '' }}
         env:
           COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
+
+      # Tonight's slate and last night's box scores are now in place, so start
+      # the prediction run in the app repo instead of waiting for its own cron,
+      # which GitHub routinely starts hours late. Needs a fine-grained token
+      # with Actions read/write on that repo; without one the cron still runs.
+      - name: Start daily inference
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ secrets.INFERENCE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::INFERENCE_DISPATCH_TOKEN is not set; daily inference waits for its own schedule"
+            exit 0
+          fi
+          gh workflow run daily-inference.yml -R bryanlrj11/advanced-nba-analytics-project
