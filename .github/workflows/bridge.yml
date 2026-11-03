@@ -35,4 +35,4 @@ jobs:
             echo "::notice::INFERENCE_DISPATCH_TOKEN is not set; daily inference waits for its own schedule"
             exit 0
           fi
-          gh workflow run daily-inference.yml -R bryanlrj11/advanced-nba-analytics-project
+          gh workflow run daily-inference.yml -R bryanlrj11/advanced-nba-analytics-project --ref main
