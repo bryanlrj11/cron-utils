@@ -22,17 +22,40 @@ jobs:
         env:
           COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
 
-      # Tonight's slate and last night's box scores are now in place, so start
-      # the prediction run in the app repo instead of waiting for its own cron,
-      # which GitHub routinely starts hours late. Needs a fine-grained token
+      # The bridge runs after every nba collection, several times a day; start
+      # the day's predictions only once last night's games are final and bridged.
+      - name: Check last night's games are in
+        id: gate
+        if: github.event_name == 'workflow_run'
+        run: python -u -m jobs.inference_gate
+        env:
+          COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
+
+      # Start the prediction run in the app repo instead of waiting for its own
+      # cron, which GitHub routinely starts hours late. Needs a fine-grained token
       # with Actions read/write on that repo; without one the cron still runs.
       - name: Start daily inference
-        if: github.event_name == 'workflow_run'
+        if: github.event_name == 'workflow_run' && steps.gate.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.INFERENCE_DISPATCH_TOKEN }}
+          APP_REPO: bryanlrj11/advanced-nba-analytics-project
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::notice::INFERENCE_DISPATCH_TOKEN is not set; daily inference waits for its own schedule"
             exit 0
           fi
-          gh workflow run daily-inference.yml -R bryanlrj11/advanced-nba-analytics-project --ref main
+          today=$(TZ=America/New_York date +%F)
+          since=$(date -u -d "TZ=\"America/New_York\" $today 00:00" +%FT%TZ)
+          runs=$(gh run list -R "$APP_REPO" -w daily-inference.yml --created ">=$since" \
+            --limit 50 --json status,conclusion)
+          started=$(jq '[.[] | select(.status != "completed" or .conclusion == "success")] | length' <<<"$runs")
+          failed=$(jq '[.[] | select(.conclusion == "failure")] | length' <<<"$runs")
+          if [ "$started" -gt 0 ]; then
+            echo "::notice::Daily inference for $today is already running or done"
+            exit 0
+          fi
+          if [ "$failed" -ge 2 ]; then
+            echo "::warning::Daily inference failed $failed times for $today; not retrying again"
+            exit 0
+          fi
+          gh workflow run daily-inference.yml -R "$APP_REPO" --ref main

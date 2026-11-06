@@ -1,7 +1,11 @@
 name: nba
 on:
+  # GitHub starts these hours late (3.5-7h seen in Oct-Nov 2026), so the night
+  # slots are watchers: whichever one is running while a slate is being played
+  # waits for its last final buzzer and collects then (jobs.nba --wait-minutes).
+  # 10:13 and 16:13 catch tracking tables that publish after the final.
   schedule:
-    - cron: "13 10,16 * * *"   # ~05-06h & 11-12h ET: after games finalize, then catch lagging tables
+    - cron: "13 0,2,4,10,16 * * *"
   workflow_dispatch:
     inputs:
       since:
@@ -11,7 +15,7 @@ concurrency: nba
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -42,4 +46,5 @@ jobs:
           COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
           NBA_PROXY: socks5h://127.0.0.1:40000
           SINCE: ${{ inputs.since }}
-        run: python -u -m jobs.nba ${SINCE:+--since "$SINCE"}
+          WAIT_MINUTES: ${{ github.event_name == 'schedule' && '300' || '0' }}
+        run: python -u -m jobs.nba --wait-minutes "$WAIT_MINUTES" ${SINCE:+--since "$SINCE"}
