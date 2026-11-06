@@ -17,6 +17,7 @@ import unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import psycopg2.errors
 import psycopg2.extras
 import requests
 
@@ -178,7 +179,7 @@ def blank_implausible_defense(game_rows: list[dict]) -> int:
     return len(game_rows)
 
 
-def recompute_days_rest(conn, since: date, commit: bool) -> int:
+def recompute_days_rest(conn, since: date, commit: bool, attempts: int = 4) -> int:
     """Set days_rest for rows on or after `since` the way the historical rows have it.
 
     days_rest is days between the player's previous box-score row (DNPs included,
@@ -186,7 +187,23 @@ def recompute_days_rest(conn, since: date, commit: bool) -> int:
     It depends on every earlier row, so it is recomputed after inserts rather than
     at build time (a game loaded late shifts the rest of the next one). Only rows
     whose value changes are written. Returns that count.
+
+    The scan-then-update transaction is long enough that CockroachDB sometimes
+    aborts it with a serialization retry when other sessions touch the table;
+    it is recomputed from scratch, so retrying is safe.
     """
+    for attempt in range(attempts):
+        try:
+            return _recompute_days_rest_once(conn, since, commit)
+        except psycopg2.errors.SerializationFailure:
+            conn.rollback()
+            if attempt == attempts - 1:
+                raise
+            print(f"days_rest update hit a serialization retry; retrying ({attempt + 1}/{attempts - 1})")
+            time.sleep(2 ** attempt)
+
+
+def _recompute_days_rest_once(conn, since: date, commit: bool) -> int:
     with conn.cursor() as cur:
         cur.execute(
             "WITH r AS (SELECT p.player_id, p.game_id, p.days_rest, g.game_date, "
