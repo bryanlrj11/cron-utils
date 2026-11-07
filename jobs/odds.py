@@ -41,8 +41,17 @@ MARKETS = [
     "player_points_alternate", "player_rebounds_alternate", "player_assists_alternate",
     "player_threes_alternate", "player_blocks_alternate", "player_steals_alternate",
 ]
-BOOKMAKERS = "tab"
-CREDITS_PER_EVENT = len(MARKETS)  # one bookmaker costs the same as one region
+# Two-sided main lines. TAB does not post them; Pinnacle does, and its closing price is
+# the benchmark for closing-line value. Only close runs pay for these (+1 credit each).
+STANDARD_MARKETS = [
+    "player_points", "player_rebounds", "player_assists",
+    "player_threes", "player_blocks", "player_steals",
+]
+CREDITS_PER_EVENT = len(MARKETS)  # an open snapshot; close adds the standard markets
+BETTABLE_BOOKMAKER = "tab"
+REFERENCE_BOOKMAKERS = ["pinnacle", "fanduel", "draftkings"]
+# Up to 10 bookmakers bill as one region, so the reference books add no credits by themselves.
+BOOKMAKERS = ",".join([BETTABLE_BOOKMAKER, *REFERENCE_BOOKMAKERS])
 WINDOWS = {"open": timedelta(hours=30), "close": timedelta(hours=3)}
 MIN_BOOKMAKERS = 1  # a snapshot with no bookmaker means lines are not posted yet
 RETRY_AFTER = timedelta(hours=1)
@@ -57,6 +66,26 @@ WATCH_MAX_RUNTIME = timedelta(hours=5, minutes=40)  # inside the workflow's time
 # Games this far past the runtime budget keep a watcher up and are handed to a successor.
 # A watcher with nothing nearer than this exits, so hand-overs cannot spin while idle.
 CHAIN_HORIZON = timedelta(hours=8)
+
+
+def markets_for(kind: str) -> list[str]:
+    """Markets requested for a snapshot kind; only close runs add the two-sided mains."""
+    return MARKETS + STANDARD_MARKETS if kind == "close" else MARKETS
+
+
+def split_payload(payload: dict) -> tuple[dict, dict | None]:
+    """Separate TAB's quotes from the reference books' in one event payload.
+
+    The thin-snapshot checks count bookmakers in the stored payload, so TAB must stay
+    alone in the original kind: another book posting lines must not hide that TAB has not.
+
+    Returns:
+        (payload with only TAB, payload with only the reference books or None if empty).
+    """
+    books = payload.get("bookmakers") or []
+    tab = [b for b in books if b.get("key") == BETTABLE_BOOKMAKER]
+    reference = [b for b in books if b.get("key") != BETTABLE_BOOKMAKER]
+    return {**payload, "bookmakers": tab}, ({**payload, "bookmakers": reference} if reference else None)
 
 
 class QuotaExhausted(Exception):
@@ -113,16 +142,18 @@ def _snapshot_event(conn, pool: KeyPool, kind: str, event: dict) -> str:
         "saved", "skipped" (the key was rejected; carry on with other events) or
         "stop" (no usable keys left, or the pool could not supply one).
     """
-    params = {"bookmakers": BOOKMAKERS, "markets": ",".join(MARKETS), "oddsFormat": "decimal"}
+    markets = markets_for(kind)
+    credits = len(markets)
+    params = {"bookmakers": BOOKMAKERS, "markets": ",".join(markets), "oddsFormat": "decimal"}
     try:
-        h, key = pool.acquire(CREDITS_PER_EVENT)
+        h, key = pool.acquire(credits)
         payload, remaining = _get(f"/events/{event['id']}/odds", key, params)
     except QuotaExhausted:
         pool.mark_exhausted(h)
         conn.commit()
         print(f"key {h} exhausted; rotating")
         try:
-            h, key = pool.acquire(CREDITS_PER_EVENT)
+            h, key = pool.acquire(credits)
             payload, remaining = _get(f"/events/{event['id']}/odds", key, params)
         except (QuotaExhausted, RuntimeError):
             print("no usable keys left; stopping", file=sys.stderr)
@@ -137,18 +168,22 @@ def _snapshot_event(conn, pool: KeyPool, kind: str, event: dict) -> str:
         return "stop"
 
     pool.record_remaining(h, remaining)
+    tab_payload, reference_payload = split_payload(payload)
     # A later close snapshot always wins; a later open one only if it is no thinner.
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO raw_odds_snapshots (event_id, kind, commence_time, key_hash, payload) "
-            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (event_id, kind) DO UPDATE SET "
-            "payload=excluded.payload, key_hash=excluded.key_hash, fetched_at=now(), "
-            "commence_time=excluded.commence_time "
-            "WHERE excluded.kind = 'close' OR "
-            "COALESCE(jsonb_array_length(excluded.payload->'bookmakers'), 0) >= "
-            "COALESCE(jsonb_array_length(raw_odds_snapshots.payload->'bookmakers'), 0)",
-            (event["id"], kind, event["commence_time"], h, json.dumps(payload)),
-        )
+        for stored_kind, stored_payload in ((kind, tab_payload), (f"{kind}_ref", reference_payload)):
+            if stored_payload is None:
+                continue
+            cur.execute(
+                "INSERT INTO raw_odds_snapshots (event_id, kind, commence_time, key_hash, payload) "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (event_id, kind) DO UPDATE SET "
+                "payload=excluded.payload, key_hash=excluded.key_hash, fetched_at=now(), "
+                "commence_time=excluded.commence_time "
+                "WHERE excluded.kind LIKE 'close%%' OR "
+                "COALESCE(jsonb_array_length(excluded.payload->'bookmakers'), 0) >= "
+                "COALESCE(jsonb_array_length(raw_odds_snapshots.payload->'bookmakers'), 0)",
+                (event["id"], stored_kind, event["commence_time"], h, json.dumps(stored_payload)),
+            )
     conn.commit()
     print(f"saved {event['id']} via key {h} ({remaining} credits left)")
     return "saved"
